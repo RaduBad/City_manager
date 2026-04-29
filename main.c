@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <errno.h>
 
+
 #define SIZE 30
 #define PATH_SIZE 512
 typedef struct{
@@ -499,6 +500,26 @@ void filter(const char *district_id, USER *u, char **conditions, int ncond) {
     log_action(district_id, u->role, u->user, "filter");
 }
 
+void remove_district(const char* district_id, USER* u){
+    if (strcmp(u->role, "manager") != 0) {
+        fprintf(stderr, "ERROR: only managers can remove reports.\n");
+        return;
+    }
+
+    char* symlink="active_reports-";
+    strcat(symlink,district_id);
+    symlink[strlen(symlink)-1]='\0';
+    pid_t p = fork();
+    if(p == 0){
+
+        execlp("rm", "rm", "-rf", district_id ,NULL);
+        execlp("rm", "rm", "-rf", symlink ,NULL);
+        exit(0);
+    }
+
+
+}
+
 int main(int argc, char**argv){
 
 
@@ -553,6 +574,8 @@ int main(int argc, char**argv){
                 i++;
             }
             filter(dist, &u, conds, ncond);
+        } else if (strcmp(argv[i], "--remove_district")==0 && i + 1 < argc){
+            remove_district(argv[++i],&u);
         }
     }
     
