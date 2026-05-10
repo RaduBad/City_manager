@@ -4,10 +4,12 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <dirent.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
 
 
 #define SIZE 30
@@ -88,6 +90,35 @@ void log_action(const char *district_id, const char *role, char *user, char *act
     close(fd);
 }
 
+
+void log_action_with_monitor_note(const char *district_id, const char *role,
+                                   char *user, char *action,
+                                   const char *monitor_note) {
+    char path[PATH_SIZE];
+    snprintf(path, sizeof(path), "%s/logged_district", district_id);
+
+    if (strcmp(role, "inspector") == 0) {
+        fprintf(stderr, "WARNING: inspector '%s' cannot write to log – skipping log entry.\n", user);
+        return;
+    }
+
+    int fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (fd < 0) {
+        perror("log open");
+        return;
+    }
+
+    char buf[PATH_SIZE * 2];
+    time_t now = time(NULL);
+    char *ts = ctime(&now);
+    ts[strlen(ts)-1] = '\0';
+    int len = snprintf(buf, sizeof(buf),
+                       "[%s] role=%s user=%s action=%s | monitor: %s\n",
+                       ts, role, user, action, monitor_note);
+    write(fd, buf, len);
+    close(fd);
+}
+
 int check_access(const char *path, char *role, int need_read, int need_write) {
     struct stat st;
     if (stat(path, &st) != 0) {
@@ -104,7 +135,6 @@ int check_access(const char *path, char *role, int need_read, int need_write) {
         if (need_write && !(mode & S_IWGRP)) ok = 0;
     }
     if (!ok) {
-
         fprintf(stderr, "ERROR: role '%s' does not have required access to '%s' \n",role, path);
     }
     return ok;
@@ -141,15 +171,49 @@ void init_district(const char *district_id) {
     create_symlink(district_id);
 }
 
+
+int notify_monitor(char *reason, size_t reason_size) {
+    int fd = open(".monitor_pid", O_RDONLY);
+    if (fd < 0) {
+        snprintf(reason, reason_size,
+                 "could not open .monitor_pid (%s)", strerror(errno));
+        return 0;
+    }
+
+    char buf[32] = {0};
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+
+    if (n <= 0) {
+        snprintf(reason, reason_size, ".monitor_pid is empty or unreadable");
+        return 0;
+    }
+
+    pid_t monitor_pid = (pid_t)atol(buf);
+    if (monitor_pid <= 0) {
+        snprintf(reason, reason_size, "invalid PID in .monitor_pid: '%s'", buf);
+        return 0;
+    }
+
+    if (kill(monitor_pid, SIGUSR1) != 0) {
+        snprintf(reason, reason_size,
+                 "kill(%d, SIGUSR1) failed (%s)", (int)monitor_pid, strerror(errno));
+        return 0;
+    }
+
+    snprintf(reason, reason_size, "notified monitor PID %d via SIGUSR1", (int)monitor_pid);
+    return 1;
+}
+
 void add(char* district_id , USER* u){
-init_district(district_id);
+    init_district(district_id);
  
     char path[PATH_SIZE];
     snprintf(path, sizeof(path), "%s/reports.dat", district_id);
  
-   if (!check_access(path, u->role, 0, 1)) {
+    if (!check_access(path, u->role, 0, 1)) {
         return;
-   }
+    }
  
     REPORT r;
     
@@ -205,13 +269,15 @@ init_district(district_id);
  
     chmod(path, 0664);
     printf("Report %d added to district '%s'.\n", r.ID, district_id);
- 
+
+    
+    char monitor_note[PATH_SIZE];
+    notify_monitor(monitor_note, sizeof(monitor_note));
+    
+
     char action[PATH_SIZE];
     snprintf(action, sizeof(action), "add report_id=%d", r.ID);
-    log_action(district_id, u->role, u->user, action);
-
-
-
+    log_action_with_monitor_note(district_id, u->role, u->user, action, monitor_note);
 }
  
 void list(const char *district_id, USER *u) {
@@ -255,57 +321,54 @@ void list(const char *district_id, USER *u) {
 }
 
 void view(const char *district_id, int report_id, USER *u) {
-char path[PATH_SIZE];
-snprintf(path, sizeof(path), "%s/reports.dat", district_id);
+    char path[PATH_SIZE];
+    snprintf(path, sizeof(path), "%s/reports.dat", district_id);
 
     if (!check_access(path, u->role, 1, 0)) 
         return;
 
-int fd = open(path, O_RDONLY);
-if (fd < 0) { 
-    perror("reports.dat open"); 
-    return; 
-}
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { 
+        perror("reports.dat open"); 
+        return; 
+    }
 
-REPORT r;
-int found = 0;
-while (read(fd, &r, sizeof(REPORT)) == sizeof(REPORT)) {
-if (r.ID == report_id) {
-    found = 1;
-    printf("─────────────────────────────────────\n");
-    printf("Report ID : %d\n", r.ID);
-    printf("Inspector : %s\n", r.inspector_name);
-    printf("GPS : %.6f, %.6f\n", r.coordinates.latitude, r.coordinates.longitude);
-    printf("Category : %s\n", r.issue_category);
-    printf("Severity : %d\n", r.severity_level);
-    printf("Timestamp : %s", ctime(&r.timestamp));
-    printf("Description : %s\n", r.description);
-    printf("─────────────────────────────────────\n");
-    break;
-}
-}
-close(fd);
+    REPORT r;
+    int found = 0;
+    while (read(fd, &r, sizeof(REPORT)) == sizeof(REPORT)) {
+        if (r.ID == report_id) {
+            found = 1;
+            printf("─────────────────────────────────────\n");
+            printf("Report ID : %d\n", r.ID);
+            printf("Inspector : %s\n", r.inspector_name);
+            printf("GPS : %.6f, %.6f\n", r.coordinates.latitude, r.coordinates.longitude);
+            printf("Category : %s\n", r.issue_category);
+            printf("Severity : %d\n", r.severity_level);
+            char *ts = ctime(&r.timestamp);
+            ts[strlen(ts)-1] = '\0';
+            printf("Timestamp : %s\n", ts);
+            printf("Description: %s\n", r.description);
+            printf("─────────────────────────────────────\n");
+            break;
+        }
+    }
+    close(fd);
 
-if (!found) 
-    fprintf(stderr, "Report %d not found in district '%s'.\n", report_id, district_id);
+    if (!found)
+        fprintf(stderr, "Report %d not found in district '%s'.\n", report_id, district_id);
 
-char action[64];
-snprintf(action, sizeof(action), "view report_id=%d", report_id);
-log_action(district_id, u->role, u->user, action);
+    char action[64];
+    snprintf(action, sizeof(action), "view report_id=%d", report_id);
+    log_action(district_id, u->role, u->user, action);
 }
 
 void remove_report(const char *district_id, int report_id, USER *u) {
-    if (strcmp(u->role, "manager") != 0) {
-        fprintf(stderr, "ERROR: only managers can remove reports.\n");
-        return;
-    }
- 
     char path[PATH_SIZE];
     snprintf(path, sizeof(path), "%s/reports.dat", district_id);
- 
-   if (!check_access(path, u->role, 1, 1)){ 
-    return;
-   }
+
+    if (!check_access(path, u->role, 1, 1)){ 
+        return;
+    }
  
     int fd = open(path, O_RDWR);
     if (fd < 0) { 
@@ -315,7 +378,7 @@ void remove_report(const char *district_id, int report_id, USER *u) {
  
     struct stat st;
     fstat(fd, &st);
-    int total = st.st_size / sizeof(REPORT); //nr de rapoarte
+    int total = st.st_size / sizeof(REPORT);
  
     REPORT *buf = malloc(total * sizeof(REPORT));
     if (!buf) { 
@@ -338,7 +401,6 @@ void remove_report(const char *district_id, int report_id, USER *u) {
         free(buf); close(fd); return;
     }
  
-
     lseek(fd, 0, SEEK_SET);
     for (int i = 0; i < count; i++)
         write(fd, &buf[i], sizeof(REPORT));
@@ -363,9 +425,9 @@ void update_threshold(const char *district_id, int value, USER *u) {
     char path[PATH_SIZE];
     snprintf(path, sizeof(path), "%s/district.cfg", district_id);
  
-   if (!check_access(path, u->role, 0, 1)){ 
-    return;
-   }
+    if (!check_access(path, u->role, 0, 1)){ 
+        return;
+    }
  
     int fd = open(path, O_WRONLY | O_TRUNC);
     if (fd < 0) { 
@@ -500,30 +562,66 @@ void filter(const char *district_id, USER *u, char **conditions, int ncond) {
     log_action(district_id, u->role, u->user, "filter");
 }
 
-void remove_district(const char* district_id, USER* u){
+
+void remove_district(const char *district_id, USER *u) {
     if (strcmp(u->role, "manager") != 0) {
-        fprintf(stderr, "ERROR: only managers can remove reports.\n");
+        fprintf(stderr, "ERROR: only managers can remove a district.\n");
         return;
     }
 
-    char* symlink="active_reports-";
-    strcat(symlink,district_id);
-    symlink[strlen(symlink)-1]='\0';
-    pid_t p = fork();
-    if(p == 0){
 
-        execlp("rm", "rm", "-rf", district_id ,NULL);
-        execlp("rm", "rm", "-rf", symlink ,NULL);
-        exit(0);
+    struct stat st;
+    if (stat(district_id, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "ERROR: district directory '%s' does not exist.\n", district_id);
+        return;
     }
 
+    char link_name[PATH_SIZE];
+    snprintf(link_name, sizeof(link_name), "active_reports-%s", district_id);
 
+    struct stat lst;
+    if (lstat(link_name, &lst) == 0) {
+        if (unlink(link_name) != 0)
+            perror("unlink symlink");
+        else
+            printf("Symlink '%s' removed.\n", link_name);
+    } else {
+        fprintf(stderr, "WARNING: symlink '%s' not found – skipping.\n", link_name);
+    }
+
+   
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return;
+    }
+
+    if (pid == 0) {
+        
+        execlp("rm", "rm", "-rf", district_id, (char *)NULL);
+        
+        perror("execlp rm");
+        exit(EXIT_FAILURE);
+    }
+
+    
+    int status;
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("waitpid");
+        return;
+    }
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        printf("District '%s' removed successfully.\n", district_id);
+    else
+        fprintf(stderr, "ERROR: 'rm -rf %s' failed (exit status %d).\n",
+                district_id, WEXITSTATUS(status));
 }
 
 int main(int argc, char**argv){
 
-
     USER u;
+    memset(&u, 0, sizeof(u));
     check_symlinks();
  
     for (int i = 1; i < argc; i++) {
@@ -557,7 +655,7 @@ int main(int argc, char**argv){
         } else if (strcmp(argv[i], "--remove_report") == 0 && i + 2 < argc) {
             const char *dist = argv[++i];
             int rid = atoi(argv[++i]);
-            remove_report(dist, rid,&u);
+            remove_report(dist, rid, &u);
  
         } else if (strcmp(argv[i], "--update_threshold") == 0 && i + 2 < argc) {
             const char *dist = argv[++i];
@@ -574,11 +672,11 @@ int main(int argc, char**argv){
                 i++;
             }
             filter(dist, &u, conds, ncond);
-        } else if (strcmp(argv[i], "--remove_district")==0 && i + 1 < argc){
-            remove_district(argv[++i],&u);
+
+        } else if (strcmp(argv[i], "--remove_district") == 0 && i + 1 < argc) {
+            remove_district(argv[++i], &u);
         }
     }
     
-
     return 0;
 }
